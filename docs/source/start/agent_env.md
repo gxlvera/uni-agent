@@ -18,8 +18,7 @@ The first step is to start a sandbox. You can do this either locally or on a rem
 
 ### Local deployment
 
-Comming soon.
-<!-- Local deployment starts a sandbox as a Docker container on your machine, then connects to the `swerex` server inside that container. This is the easiest way to debug environment behavior before moving to a remote platform.
+Local deployment starts a sandbox as a Docker container on your machine, then connects to the `swerex` server inside that container. This is the easiest way to debug environment behavior before moving to a remote platform.
 
 **Dependencies.** Install the runtime package and make sure a container runtime is available:
 
@@ -68,7 +67,7 @@ You can run the full demo from the repo root with:
 
 ```bash
 DEPLOYMENT=local python examples/agent_env/demo.py
-``` -->
+```
 
 ### Remote deployment (VEFAAS)
 
