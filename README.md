@@ -45,7 +45,7 @@ Uni-Agent builds on top of latest `verl` release and can use it as a normal Pyth
 
 ```bash
 git submodule update --init --recursive
-pip install -e --no-deps ./verl
+pip install --no-deps -e ./verl
 
 # Other Dependencies
 pip install swe-rex loguru pydantic pydantic_settings aiohttp

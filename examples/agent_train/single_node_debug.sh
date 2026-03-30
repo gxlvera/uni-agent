@@ -5,7 +5,7 @@ project_name='Uni-Agent-SWE-Agent'
 exp_name='GRPO-Qwen3-30B-R2E-Fully-Async'
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Instruct-xml-template"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-4B-Instruct-xml-template"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/swe_agent/r2e_gym_subset_filtered.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/swe_agent/swe_bench_verified.parquet"}
@@ -14,7 +14,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${RAY_DATA_HOME}/data/swe_agent/runtime_env.yaml"}
 AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-"${RAY_DATA_HOME}/data/swe_agent/agent_config.yaml"}
 
 rollout_mode="async"
-rollout_name="vllm" # sglang or vllm
+rollout_name="sglang" # sglang or vllm
 
 # Algorithm parameters
 adv_estimator=grpo
@@ -49,10 +49,10 @@ val_top_k=-1
 use_dynamic_bsz=True
 offload=True
 gen_tp=4
-train_tp=4
+train_tp=2
 train_pp=1
-train_cp=4
-train_ep=8
+train_cp=1
+train_ep=1
 train_etp=1
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / train_cp))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / train_cp))
@@ -65,9 +65,9 @@ USE_MBRIDGE=True
 USE_DIST_CKPT=False
 
 # Fully async specific parameters
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-4}
-NNODES_TRAIN=${NNODES_TRAIN:-4}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
+NNODES_TRAIN=${NNODES_TRAIN:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 
 train_prompt_bsz=0
 n_resp_per_prompt=8
@@ -133,15 +133,9 @@ ray job submit --no-wait --runtime-env $RUNTIME_ENV \
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.deallocate_pipeline_outputs=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.persist_layer_norm=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type="alltoall" \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
-    actor_rollout_ref.actor.router_replay.mode="R3" \
-    actor_rollout_ref.rollout.enable_rollout_routing_replay=True \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
@@ -149,6 +143,7 @@ ray job submit --no-wait --runtime-env $RUNTIME_ENV \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1 \
     actor_rollout_ref.rollout.agent.num_workers=8 \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${AGENT_CONFIG_PATH} \
+    actor_rollout_ref.rollout.agent.default_agent_loop=swe_agent \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -184,7 +179,7 @@ ray job submit --no-wait --runtime-env $RUNTIME_ENV \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.total_epochs=20 \
     trainer.resume_mode=auto \

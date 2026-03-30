@@ -28,7 +28,7 @@ Recommended: use the bundled `verl` checkout/submodule in this repo:
 
 ```bash
 git submodule update --init --recursive
-pip install -e --no-deps ./verl
+pip install --no-deps -e ./verl
 ```
 
 Alternatively, you can install from PyPI:
