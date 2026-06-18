@@ -6,7 +6,7 @@ per-session **prefix trie**: every committed assistant turn becomes a node that
 may carry a :class:`BranchCheckpoint`, and an incoming request longest-prefix
 matches against any path and continues from the nearest checkpoint.
 
-Design (see ``docs/trie_m1_implementation_plan.md``):
+Design (tracked in GitHub issue #51):
 
 - Each node stores exactly one message; the full transcript is rebuilt by
   walking ``parent`` pointers. Children are keyed by :class:`MessageKey`.
