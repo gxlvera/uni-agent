@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MalformedRequestError, MessageCodec
-from uni_agent.gateway.session.trie import BranchHandle, PrefixTrie
+from uni_agent.gateway.session.trie import BranchHandle, PrefixTrie, PrepareResult
 from uni_agent.gateway.session.types import SessionHandle, Trajectory, TrajectoryBuffer
 
 
@@ -154,7 +154,7 @@ class GatewaySession:
                 if encoded.length_exhausted_trajectory is not None:
                     empty_msg = {"role": "assistant", "content": ""}
                     if self._trie_enabled:
-                        self._trie.commit(
+                        self._prefix_trie().commit(
                             encoded.branch_handle,
                             encoded.buffer,
                             empty_msg,
@@ -218,7 +218,7 @@ class GatewaySession:
                         detail=f"Session {self.handle.session_id} is {self.phase.value.lower()}",
                     )
                 if self._trie_enabled:
-                    self._trie.commit(
+                    self._prefix_trie().commit(
                         encoded.branch_handle,
                         encoded.buffer,
                         assistant_msg,
@@ -348,18 +348,19 @@ class GatewaySession:
         encode paths as the legacy flow — only the state model differs.
         """
         messages = request_context["messages"]
-        prepared = self._trie.prepare(messages)
+        trie = self._prefix_trie()
+        prepared = trie.prepare(messages)
         # ``prepare`` has registered a pending node; if encoding fails (or the
         # request is cancelled) before we hand the buffer to the backend, abandon
         # it so the in-flight bookkeeping does not leak.
         try:
             return await self._encode_prepared(payload, request_context, prepared)
         except BaseException:
-            self._trie.abandon(prepared.branch_handle)
+            trie.abandon(prepared.branch_handle)
             raise
 
     async def _encode_prepared(
-        self, payload: dict[str, Any], request_context: dict[str, Any], prepared
+        self, payload: dict[str, Any], request_context: dict[str, Any], prepared: PrepareResult
     ) -> EncodedData:
         """Encode inputs for an already-prepared trie branch (see caller)."""
         messages = request_context["messages"]
@@ -458,7 +459,7 @@ class GatewaySession:
     def _abandon_pending(self, encoded: EncodedData) -> None:
         """Release the trie pending node when a generation fails before commit."""
         if self._trie_enabled and encoded.branch_handle is not None:
-            self._trie.abandon(encoded.branch_handle)
+            self._prefix_trie().abandon(encoded.branch_handle)
 
     async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
         """Store session-level reward metadata without closing the session."""
@@ -505,11 +506,13 @@ class GatewaySession:
             "updated_at": self.updated_at,
         }
         if self._trie_enabled:
+            trie = self._prefix_trie()
+            num_branches = trie.num_branches()
             snapshot.update(
                 {
-                    "num_branches": self._trie.num_branches(),
-                    "num_inflight_generations": self._trie.num_inflight(),
-                    "has_active_trajectory": self._trie.num_branches() > 0,
+                    "num_branches": num_branches,
+                    "num_inflight_generations": trie.num_inflight(),
+                    "has_active_trajectory": num_branches > 0,
                 }
             )
         else:
@@ -520,6 +523,11 @@ class GatewaySession:
                 }
             )
         return snapshot
+
+    def _prefix_trie(self) -> PrefixTrie:
+        if self._trie is None:
+            raise RuntimeError("Gateway trie is not enabled")
+        return self._trie
 
     def _is_request_context_prefix(
         self,
@@ -597,11 +605,12 @@ class GatewaySession:
 
     def _materialize_trie_trajectories(self) -> list[Trajectory]:
         """Traverse the trie and emit one trajectory per terminal checkpoint."""
+        trie = self._prefix_trie()
         trajectories: list[Trajectory] = []
-        for node in self._trie.iter_export_nodes():
+        for node in trie.iter_export_nodes():
             checkpoint = node.checkpoint
-            messages = checkpoint.messages or self._trie.rebuild_messages(node)
-            images, videos = self._trie.collect_multi_modal(node)
+            messages = checkpoint.messages or trie.rebuild_messages(node)
+            images, videos = trie.collect_multi_modal(node)
             trajectories.append(
                 self._trajectory_from_buffer(
                     checkpoint.trajectory_buffer,
