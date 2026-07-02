@@ -67,6 +67,10 @@ class EncodedData:
     branch_handle: BranchHandle | None = None
     new_image_data: list[Any] | None = None
     new_video_data: list[Any] | None = None
+    # Trie-mode only: True when this branch reused a cloned checkpoint and
+    # extended it incrementally (vs. a full re-encode). Passed to ``trie.commit``
+    # so it can mark the ancestor checkpoint absorbed. See ``PrefixTrie.commit``.
+    use_incremental: bool = False
 
 
 @dataclass
@@ -163,6 +167,7 @@ class GatewaySession:
                             image_data=encoded.new_image_data,
                             video_data=encoded.new_video_data,
                             extra_fields={"finish_reason": "length"},
+                            incremental=encoded.use_incremental,
                         )
                     else:
                         self.trajectories.append(encoded.length_exhausted_trajectory)
@@ -226,6 +231,7 @@ class GatewaySession:
                         messages=encoded.messages,
                         image_data=encoded.new_image_data,
                         video_data=encoded.new_video_data,
+                        incremental=encoded.use_incremental,
                     )
                 else:
                     if encoded.materialized_trajectory is not None:
@@ -428,6 +434,7 @@ class GatewaySession:
                         branch_handle=prepared.branch_handle,
                         new_image_data=new_image_data,
                         new_video_data=new_video_data,
+                        use_incremental=use_incremental,
                     )
                 buffer.response_ids.extend(incremental_ids)
                 buffer.response_mask.extend([0] * len(incremental_ids))
@@ -454,6 +461,7 @@ class GatewaySession:
             branch_handle=prepared.branch_handle,
             new_image_data=new_image_data,
             new_video_data=new_video_data,
+            use_incremental=use_incremental,
         )
 
     def _abandon_pending(self, encoded: EncodedData) -> None:

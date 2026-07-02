@@ -223,6 +223,14 @@ class TrieNode:
     video_data: list[Any] | None = None
     # In-flight generations attached beneath this node (failure-cleanup hook).
     inflight: int = 0
+    # Set when a later *incremental* continuation cloned this checkpoint and
+    # carried its trainable tokens forward, so this node must NOT be exported on
+    # its own (its buffer is a strict trainable-prefix of the continuation's).
+    # A *full re-encode* child does NOT set this: it re-tokenizes the whole
+    # prompt (this node's generated tokens become non-trainable prompt there), so
+    # this node stays exportable — matching the legacy "materialize on context
+    # break" behavior. See ``PrefixTrie.commit`` / ``iter_export_nodes``.
+    absorbed: bool = False
 
     @property
     def is_root(self) -> bool:
@@ -424,12 +432,25 @@ class PrefixTrie:
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
         extra_fields: dict[str, Any] | None = None,
+        incremental: bool = False,
     ) -> TrieNode:
-        """Resolve the pending node and attach the generated assistant child."""
+        """Resolve the pending node and attach the generated assistant child.
+
+        ``incremental`` records how this branch's buffer was built. When True the
+        buffer was cloned from the nearest ancestor checkpoint and extended, so
+        that ancestor's trainable tokens now live inside this branch — we mark it
+        ``absorbed`` so it is not exported twice. When False (full re-encode, e.g.
+        a mid-session tools change) the ancestor is left exportable, mirroring
+        legacy's ``materialized_trajectory`` at a context break.
+        """
         attach_node = self._pending.pop(branch_handle.generation_id, None)
         if attach_node is None:
             raise KeyError(f"Unknown or already-committed branch_handle: {branch_handle.generation_id}")
         attach_node.inflight = max(0, attach_node.inflight - 1)
+        if incremental:
+            ckpt_ancestor, _ = self.nearest_ckpt(attach_node)
+            if ckpt_ancestor is not None:
+                ckpt_ancestor.absorbed = True
         # The checkpoint lives on the assistant node and its buffer covers the
         # request prompt PLUS the generated assistant turn, so the stored prefix
         # must include ``assistant_msg`` (this is what the next turn's
@@ -462,33 +483,18 @@ class PrefixTrie:
     def iter_export_nodes(self, *, export_all: bool = False) -> Iterator[TrieNode]:
         """Yield assistant checkpoint nodes for finalize.
 
-        By default emits only *terminal* assistant checkpoints (no committed
-        assistant descendant): rejected best-of-N siblings stay short leaves and
-        a continued branch is represented by its deepest checkpoint. With
-        ``export_all`` every committed checkpoint is emitted.
-
-        A single post-order pass (O(N) over the trie) collects the terminals;
-        each node reports whether its subtree already carries a checkpoint so an
-        ancestor knows whether it is the deepest one.
+        By default emits every committed checkpoint that was **not** absorbed by
+        a later incremental continuation. A node is ``absorbed`` only when some
+        descendant cloned its checkpoint and extended it incrementally (so this
+        node's trainable tokens already live inside that descendant's buffer). A
+        full re-encode child — e.g. a mid-session tools change — does not absorb
+        its ancestor, so both export as independent trajectories, matching the
+        legacy "materialize on context break" behavior. With ``export_all`` every
+        committed checkpoint is emitted regardless of absorption.
         """
-        if export_all:
-            yield from self._iter_checkpoint_nodes(self.root)
-            return
-        _, terminals = self._collect_terminals(self.root)
-        yield from terminals
-
-    def _collect_terminals(self, node: TrieNode) -> tuple[bool, list[TrieNode]]:
-        subtree_has_ckpt = False
-        terminals: list[TrieNode] = []
-        for child in node.children.values():
-            child_has_ckpt, child_terminals = self._collect_terminals(child)
-            subtree_has_ckpt = subtree_has_ckpt or child_has_ckpt
-            terminals.extend(child_terminals)
-        if node.checkpoint is not None:
-            if not subtree_has_ckpt:
-                terminals.append(node)
-            subtree_has_ckpt = True
-        return subtree_has_ckpt, terminals
+        for node in self._iter_checkpoint_nodes(self.root):
+            if export_all or not node.absorbed:
+                yield node
 
     def _iter_checkpoint_nodes(self, node: TrieNode) -> Iterator[TrieNode]:
         for child in node.children.values():

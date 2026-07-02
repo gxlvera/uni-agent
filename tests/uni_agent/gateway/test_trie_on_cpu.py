@@ -59,10 +59,19 @@ def make_buffer(prompt_len, response_tokens, mask_value=1):
     )
 
 
-def commit_turn(trie, messages, assistant_msg, buffer, **kw):
-    """Run one prepare -> commit cycle and return (prepare_result, node)."""
+def commit_turn(trie, messages, assistant_msg, buffer, *, incremental=None, **kw):
+    """Run one prepare -> commit cycle and return (prepare_result, node).
+
+    ``incremental`` mirrors the production ``use_incremental`` signal that the
+    gateway passes to ``commit``. When left as ``None`` it is derived the same way
+    the gateway derives it for the tool-less unit path: a reused checkpoint
+    (``trajectory_buffer is not None``) means this turn extended an existing
+    branch incrementally. Pass it explicitly to model a full re-encode that reused
+    a prefix node but not its tokens (e.g. a mid-session tools change)."""
     pr = trie.prepare(messages)
-    node = trie.commit(pr.branch_handle, buffer, assistant_msg, messages=messages, **kw)
+    if incremental is None:
+        incremental = pr.trajectory_buffer is not None
+    node = trie.commit(pr.branch_handle, buffer, assistant_msg, messages=messages, incremental=incremental, **kw)
     return pr, node
 
 
@@ -131,7 +140,8 @@ def test_sequential_extension_single_chain():
     # checkpoint covers up to and including a1
     assert pr2.checkpoint_messages == [sys_msg(), user_msg("fix bug"), a1]
     a2 = asst_msg("done")
-    trie.commit(pr2.branch_handle, make_buffer(100, [200, 201, 202, 50, 51, 300]), a2, messages=msgs2)
+    # turn 2 extends turn 1's cloned checkpoint incrementally -> absorbs a1.
+    trie.commit(pr2.branch_handle, make_buffer(100, [200, 201, 202, 50, 51, 300]), a2, messages=msgs2, incremental=True)
 
     # single linear chain, one exportable branch
     assert trie.num_branches() == 1

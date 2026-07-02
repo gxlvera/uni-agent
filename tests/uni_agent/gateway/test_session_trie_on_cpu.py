@@ -262,9 +262,48 @@ def test_trie_no_duplicate_multimodal_on_full_encode_midbranch():
         return await session.finalize()
 
     trajectories = _run(scenario())
-    assert len(trajectories) == 1
-    images = trajectories[0].multi_modal_data["images"]
+    # The mid-branch tools change is a full re-encode, so it does NOT absorb the
+    # turn-1 branch: both export (see the P1-a case-① regression test below).
+    assert len(trajectories) == 2
+    # The re-encoded turn-2 trajectory carries the full prompt's media exactly
+    # once — the dedup guard is that image A is not repeated.
+    full_reencode = max(trajectories, key=lambda t: len(t.multi_modal_data["images"]))
+    images = full_reencode.multi_modal_data["images"]
     assert images == ["http://x/a.png", "http://x/b.png"], f"no duplicate media expected, got {images}"
+
+
+def test_trie_exports_pre_reencode_branch_on_tools_change():
+    """P1-a (case ①): a mid-session tools change forces a full re-encode of the
+    branch. The pre-change turn's generated tokens are trainable (mask=1) only in
+    its own checkpoint — the re-encoded child carries them as non-trainable prompt
+    — so that checkpoint must still export as an independent trajectory (mirrors
+    legacy's ``materialized_trajectory`` at a context break).
+
+    Pre-fix the "deepest terminal absorbs its ancestors" export rule dropped it:
+    finalize returned 1 trajectory and turn 1's generation was lost. The
+    absorb-only-on-incremental-extension rule keeps both (2)."""
+
+    async def scenario():
+        session = _session(trie_enabled=True)
+        backend = SequencedBackend(["A1", "A2"])
+        # turn 1: no tools -> full encode, generate A1
+        out1 = await session.run_generation({"messages": [SYS, USER]}, backend)
+        a1 = {"role": "assistant", "content": out1.assistant_msg["content"]}
+        # turn 2: same prefix + new user, but tools change -> full re-encode
+        msgs2 = [SYS, USER, a1, {"role": "user", "content": "more"}]
+        await session.run_generation(
+            {"messages": msgs2, "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]},
+            backend,
+        )
+        return out1, await session.finalize()
+
+    out1, trajectories = _run(scenario())
+    # Both the turn-1 branch and the re-encoded turn-2 branch must export.
+    assert len(trajectories) == 2, "pre-re-encode branch must not be dropped"
+    # The turn-1 trajectory (shortest prompt) keeps its generated tokens trainable.
+    turn1 = min(trajectories, key=lambda t: len(t.prompt_ids))
+    assert turn1.response_mask and all(m == 1 for m in turn1.response_mask)
+    assert len(turn1.response_ids) == out1.completion_tokens
 
 
 def test_trie_abandons_pending_node_on_cancellation():
