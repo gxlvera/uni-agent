@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -135,6 +136,31 @@ def test_write_debug_snapshot_json_writes_message_history_and_session_state(tmp_
     assert record["created_at"] == "2026-06-24T01:02:03Z"
     assert record["session_state"]["has_active_trajectory"] is True
     assert record["message_history"] == [{"role": "user", "content": "hi"}]
+
+
+def test_capture_debug_snapshot_preserves_multiple_active_chains():
+    chains = [
+        SimpleNamespace(
+            chain_id=1,
+            message_history=[{"role": "user", "content": "main"}],
+            active_tool_schemas=None,
+        ),
+        SimpleNamespace(
+            chain_id=2,
+            message_history=[{"role": "user", "content": "subagent"}],
+            active_tool_schemas=[{"type": "function"}],
+        ),
+    ]
+    session = SimpleNamespace(active_chains=chains, snapshot_state=lambda: {"num_active_chains": 2})
+    actor = SimpleNamespace(_sessions={"s-debug": session})
+
+    snapshot = debug_launcher.capture_debug_snapshot(actor, "s-debug", {"openai_base_url": "http://local"})
+
+    assert [chain["chain_id"] for chain in snapshot["active_chains"]] == [1, 2]
+    assert snapshot["active_chains"][1]["message_history"][0]["content"] == "subagent"
+    assert snapshot["message_history"] == []
+    assert snapshot["active_tool_schemas"] is None
+    assert "multiple chains" in snapshot["note"]
 
 
 def test_provider_urls_strips_v1_for_anthropic_and_keeps_openai_base_url():
@@ -560,6 +586,7 @@ async def test_run_debug_session_once_fake_creates_finalizes_and_writes_trajecto
     debug_snapshot = json.loads(result.debug_snapshot_path.read_text())
     assert debug_snapshot["session_state"]["has_active_trajectory"] is True
     assert debug_snapshot["message_history"][0] == {"role": "user", "content": "Reply with OK only."}
+    assert debug_snapshot["active_chains"][0]["message_history"] == debug_snapshot["message_history"]
 
 
 @pytest.mark.asyncio

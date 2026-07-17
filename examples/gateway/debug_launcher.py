@@ -468,15 +468,29 @@ def capture_debug_snapshot(actor: _GatewayActor, session_id: str, urls: dict[str
             "session_state": None,
             "message_history": [],
             "active_tool_schemas": None,
+            "active_chains": [],
             "provider_urls": dict(urls),
             "note": "session was not available when debug snapshot was captured",
         }
-    return {
+    active_chains = [
+        {
+            "chain_id": chain.chain_id,
+            "message_history": list(chain.message_history),
+            "active_tool_schemas": chain.active_tool_schemas,
+        }
+        for chain in session.active_chains
+    ]
+    snapshot = {
         "session_state": session.snapshot_state(),
-        "message_history": list(session.message_history),
-        "active_tool_schemas": session.active_tool_schemas,
+        # Keep the original single-chain fields for existing debug consumers.
+        "message_history": active_chains[0]["message_history"] if len(active_chains) == 1 else [],
+        "active_tool_schemas": active_chains[0]["active_tool_schemas"] if len(active_chains) == 1 else None,
+        "active_chains": active_chains,
         "provider_urls": dict(urls),
     }
+    if len(active_chains) > 1:
+        snapshot["note"] = "message_history and active_tool_schemas are omitted when multiple chains are active"
+    return snapshot
 
 
 async def run_claude_once(
@@ -594,6 +608,7 @@ async def run_debug_session_once(
         "session_state": None,
         "message_history": [],
         "active_tool_schemas": None,
+        "active_chains": [],
         "provider_urls": {},
         "note": "session was not created before debug snapshot was captured",
     }

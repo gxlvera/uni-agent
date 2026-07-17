@@ -42,6 +42,14 @@ DEFAULT_ALLOWED_REQUEST_SAMPLING_KEYS = frozenset({"temperature", "top_p", "top_
 logger = logging.getLogger("gateway")
 
 
+def _validate_sampling_params(sampling_params: dict[str, Any]) -> None:
+    max_tokens = sampling_params.get("max_tokens")
+    if "max_tokens" in sampling_params and (
+        not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0
+    ):
+        raise MalformedRequestError("max_tokens must be a positive integer")
+
+
 class _GatewayActor:
     """Ray actor implementation exposed as ``GatewayActor = ray.remote(...)``.
 
@@ -164,9 +172,10 @@ class _GatewayActor:
         try:
             internal = openai_to_internal(
                 payload,
-                base_sampling_params=self._base_sampling_params,
+                base_sampling_params={**self._base_sampling_params, **session.sampling_params},
                 allowed_sampling_keys=self._allowed_request_sampling_param_keys,
             )
+            _validate_sampling_params(internal["sampling_params"])
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -189,9 +198,10 @@ class _GatewayActor:
         try:
             internal = anthropic_to_internal(
                 payload,
-                base_sampling_params=self._base_sampling_params,
+                base_sampling_params={**self._base_sampling_params, **session.sampling_params},
                 allowed_sampling_keys=self._allowed_request_sampling_param_keys,
             )
+            _validate_sampling_params(internal["sampling_params"])
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -221,7 +231,12 @@ class _GatewayActor:
         self._server_port = None
         self._server_base_url = None
 
-    async def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> SessionHandle:
+    async def create_session(
+        self,
+        session_id: str,
+        metadata: dict[str, Any] | None = None,
+        sampling_params: dict[str, Any] | None = None,
+    ) -> SessionHandle:
         """Create an actor-owned session and return its provider-compatible handle."""
         self._require_started()
         if session_id in self._sessions:
@@ -237,6 +252,7 @@ class _GatewayActor:
             codec=self._codec,
             prompt_length=self._prompt_length,
             response_length=self._response_length,
+            sampling_params=sampling_params,
         )
         return handle
 
