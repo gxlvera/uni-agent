@@ -43,12 +43,17 @@ class TrajectoryBuffer:
             output and ``0`` for continuation context tokens.
         response_logprobs: Log probabilities aligned with ``response_ids`` when
             present; continuation context tokens use ``0.0``.
+        routed_experts: Latest per-token expert-routing tensor from the backend,
+            spanning ``prompt + response``. The backend re-prefills the full
+            context each turn, so this is replaced (not accumulated) and the final
+            value covers the whole sequence (mirrors verl's tool_agent_loop).
     """
 
     prompt_ids: list[int]
     response_ids: list[int] = field(default_factory=list)
     response_mask: list[int] = field(default_factory=list)
     response_logprobs: list[float] = field(default_factory=list)
+    routed_experts: Any | None = None
 
 
 @dataclass
@@ -240,6 +245,14 @@ class GatewaySession:
                         f"got {len(log_probs)} logprobs for {len(response_ids)} tokens"
                     )
                 encoded.buffer.response_logprobs.extend(log_probs)
+
+            # R3 router replay: the backend returns routing for the full context
+            # it just prefilled (prompt + response so far + new tokens), so keep
+            # the latest value; it supersedes prior turns. The framework aligns it
+            # to input_ids when writing to TransferQueue.
+            routed_experts = getattr(output, "routed_experts", None)
+            if routed_experts is not None:
+                encoded.buffer.routed_experts = routed_experts
 
             async with self.request_lock:
                 if self.phase != SessionPhase.ACTIVE:
@@ -485,6 +498,7 @@ class GatewaySession:
             response_ids=list(buffer.response_ids),
             response_mask=list(buffer.response_mask),
             response_logprobs=list(buffer.response_logprobs),
+            routed_experts=buffer.routed_experts,
         )
 
     def _copy_chain_media(self, chain: ChainState) -> tuple[list[Any] | None, list[Any] | None]:
@@ -592,6 +606,7 @@ class GatewaySession:
             response_logprobs=response_logprobs,
             reward_info={},
             num_turns=self._count_chat_turns(chain.message_history),
+            routed_experts=chain.buffer.routed_experts,
             multi_modal_data=self._build_multi_modal_trajectory_data(
                 chain.image_data,
                 chain.video_data,

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
+import json
 import logging
+import os
 import random
 from dataclasses import dataclass, replace
 from functools import partial
+from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
@@ -15,6 +21,7 @@ from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 from uni_agent.gateway.session import SessionHandle, Trajectory
+from uni_agent.logging import sample_logging
 from verl.tools.tool_registry import initialize_tools_from_config
 from verl.utils import tensordict_utils as tu
 from verl.utils.import_utils import load_class_from_fqn
@@ -129,13 +136,56 @@ _TQ_NESTED_SEQUENCE_FIELDS = {
     "attention_mask",
     "position_ids",
     "rollout_log_probs",
+    "routed_experts",
     "rm_scores",
     "teacher_logprobs",
     "teacher_ids",
 }
 
 
+def _json_default(obj: object) -> object:
+    """Best-effort JSON coercion for reward/extra fields (numpy scalars, tensors, sets)."""
+    if isinstance(obj, set | frozenset):
+        return list(obj)
+    for attr in ("item", "tolist"):  # numpy scalar / 0-d tensor, then ndarray / tensor
+        fn = getattr(obj, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+    return str(obj)
+
+
+def _align_routed_experts(source: object, seq_len: int) -> torch.Tensor | None:
+    """Return R3 routing as an int64 ``[seq_len, layers, topk]`` tensor aligned to input_ids.
+
+    The gateway stores the last turn's routing, which already spans ``prompt + response``
+    (the backend re-prefills the full context each turn). Zero-pad / truncate defensively so
+    the field always matches ``input_ids`` even on early-return trajectories with trailing
+    context tokens; a wrong length would crash Megatron's packed-sequence replay.
+    """
+    experts = torch.as_tensor(source)
+    if experts.dim() != 3:
+        return None
+    experts = experts.to(dtype=torch.int64, device="cpu")
+    out = torch.zeros((seq_len, experts.shape[1], experts.shape[2]), dtype=torch.int64)
+    covered = min(experts.shape[0], seq_len)
+    if covered > 0:
+        out[:covered] = experts[:covered]
+    return out
+
+
 def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorDict:
+    # Optional per-sample fields (e.g. routed_experts) can be missing on degenerate
+    # trajectories; drop any column not present on every sample so the stacker never
+    # KeyErrors on a partially-present key (list_of_dict_to_tensordict keys off row 0).
+    if fields:
+        shared_keys = set(fields[0]).intersection(*(set(f) for f in fields[1:]))
+        for f in fields:
+            for key in list(f):
+                if key not in shared_keys:
+                    f.pop(key, None)
     td = tu.list_of_dict_to_tensordict(fields)
     for key in _TQ_NESTED_SEQUENCE_FIELDS:
         if key not in fields[0]:
@@ -143,7 +193,12 @@ def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorD
         values = [field[key] for field in fields]
         if not all(isinstance(value, torch.Tensor) for value in values):
             continue
-        ragged_idx = 2 if key == "position_ids" and values[0].dim() == 2 else None
+        if key == "routed_experts":
+            ragged_idx = 1  # [seq, layers, topk]: ragged on the sequence dim
+        elif key == "position_ids" and values[0].dim() == 2:
+            ragged_idx = 2
+        else:
+            ragged_idx = None
         td[key] = tu.nested_tensor_from_tensor_list(values, ragged_idx=ragged_idx)
     return td
 
@@ -154,11 +209,8 @@ def _trajectory_to_reward_dataproto(trajectory, sample_fields):
     Field shape matches AgentLoopWorker._compute_score
     (verl/experimental/agent_loop/agent_loop.py:753-772). Only fields actually
     consumed by NaiveRewardManager.run_single / RewardLoopWorker dispatch are
-    populated; tool_extra_fields / num_turns are passed via non_tensor_batch
-    for parity.
+    populated; ``__num_turns__`` rides in non_tensor_batch for parity.
     """
-    import numpy as np
-
     from verl.protocol import DataProto
 
     prompt_ids = torch.tensor(trajectory.prompt_ids, dtype=torch.long).unsqueeze(0)
@@ -191,11 +243,11 @@ class OpenAICompatibleAgentFramework(AgentFramework):
     Each sample in the batch is run as an independent session: the agent
     communicates with the Gateway via standard ``/v1/chat/completions``
     requests, and the Gateway collects token-level trajectories.  After
-    finalization, ``_score_trajectories`` dispatches the session's final
-    trajectory to a RewardLoopWorker and broadcasts the score back to all
-    trajectories in the session (matching
-    ``AgentLoopWorkerTQ._agent_loop_postprocess``); the framework then writes
-    them to the TransferQueue schema consumed by sync training.
+    finalization, scoring prefers the reward the runner posted to the session
+    (``_score_from_reward_info``); otherwise, if a RewardLoopWorker is configured,
+    ``_score_trajectories`` scores the final trajectory and broadcasts the score to all
+    trajectories in the session (matching ``AgentLoopWorkerTQ._agent_loop_postprocess``).
+    The framework then writes them to the TransferQueue schema consumed by sync training.
     """
 
     def __init__(
@@ -206,6 +258,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         reward_loop_worker_handles=None,
         processor=None,
         rollout_config=None,
+        log_dir: str | None = None,
     ):
         self.gateway_manager = gateway_manager
         self.runner_registry = runner_registry
@@ -221,6 +274,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         self._rollout_config = rollout_config
         self._runner_semaphores: dict[str, asyncio.Semaphore] = {}
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+        self._log_dir = log_dir
 
     @classmethod
     def from_config(
@@ -241,12 +295,18 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         for runner_name, runner_cfg in agent_runners_cfg.items():
             runner_registry[str(runner_name)] = _RunnerConfig.from_config(runner_name, runner_cfg)
 
+        log_dir = af_cfg.get("log_dir") or os.environ.get("UNI_AGENT_LOG_DIR") or "/tmp/uni_agent_logs"
+
+        if not bool(af_cfg.get("use_reward_loop_worker", True)):
+            reward_loop_worker_handles = None
+
         return cls(
             gateway_manager=gateway_manager,
             runner_registry=runner_registry,
             reward_loop_worker_handles=reward_loop_worker_handles,
             processor=processor,
             rollout_config=config.actor_rollout_ref.rollout,
+            log_dir=log_dir,
         )
 
     def _build_session_sampling_params(
@@ -396,6 +456,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 sample_fields=sample_fields,
                 sample_index=sample_index,
                 session_index=session_index,
+                global_steps=global_steps,
                 sampling_params=sampling_params,
             )
             for session_index in range(num_sessions)
@@ -460,6 +521,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         sample_fields: dict[str, object],
         sample_index: int,
         session_index: int,
+        global_steps: int,
         sampling_params: dict[str, object],
     ) -> tuple[list[Trajectory], dict[str, object]]:
         # Lazy-init semaphores on first use and rebind if the running loop
@@ -490,6 +552,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 sample_fields=sample_fields,
                 sample_index=sample_index,
                 session_index=session_index,
+                global_steps=global_steps,
                 runner_name=runner_name,
                 runner_config=runner_config,
                 sampling_params=sampling_params,
@@ -505,6 +568,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 sample_fields=sample_fields,
                 sample_index=sample_index,
                 session_index=session_index,
+                global_steps=global_steps,
                 runner_name=runner_name,
                 runner_config=runner_config,
                 sampling_params=sampling_params,
@@ -516,60 +580,177 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         sample_fields: dict[str, object],
         sample_index: int,
         session_index: int,
+        global_steps: int,
         runner_name: str,
         runner_config: _RunnerConfig,
         sampling_params: dict[str, object],
     ) -> tuple[list[Trajectory], dict[str, object]]:
         """Run one gateway session lifecycle and return finalized trajectories."""
         session_id = f"session-{sample_index}-{session_index}-{uuid4().hex}"
-        raw_prompt = sample_fields["raw_prompt"]
-        tools_kwargs = sample_fields.get("tools_kwargs")
-        session = await self.gateway_manager.create_session(
-            session_id,
-            sampling_params=dict(sampling_params),
-        )
-        try:
-            if runner_config.dispatch_mode == "ray_task":
-                # Ray workers run only the runner. Gateway token truth,
-                # finalization, reward scoring, and TQ writes stay in parent.
-                object_ref = _run_agent_runner_ray_task.remote(
-                    runner_fqn=runner_config.runner_fqn,
-                    runner_kwargs=runner_config.runner_kwargs,
-                    raw_prompt=raw_prompt,
-                    session=session,
-                    sample_index=sample_index,
-                    tools_kwargs=tools_kwargs,
-                )
-                await object_ref
-            else:
-                runner = self._inline_runners[runner_name]
-                await runner(
-                    raw_prompt=raw_prompt,
-                    session=session,
-                    sample_index=sample_index,
-                    **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
-                )
-            session_trajectories = await self.gateway_manager.finalize_session(session_id)
-        except Exception:
-            await self.gateway_manager.abort_session(session_id)
-            raise
-
-        # Score the session's trajectories immediately after finalization,
-        # consistent with VERL's per-sample reward path.
-        if not self.reward_loop_worker_handles or not session_trajectories:
-            return session_trajectories, sample_fields
-
-        annotations = await self._score_trajectories(session_trajectories, sample_fields)
-        scored_trajectories = []
-        for traj, (score, extra) in zip(session_trajectories, annotations, strict=True):
-            scored_trajectories.append(
-                replace(
-                    traj,
-                    reward_score=score,
-                    extra_fields={**traj.extra_fields, "reward_extra_info": extra},
-                )
+        if self._log_dir:
+            run_id = uuid4().hex
+            run_dir = Path(self._log_dir) / f"step_{int(global_steps)}" / run_id
+            log_ctx = sample_logging(run_id, run_dir / "run.log")
+        else:
+            run_dir = None
+            log_ctx = contextlib.nullcontext()
+        async with log_ctx:
+            raw_prompt = sample_fields["raw_prompt"]
+            tools_kwargs = sample_fields.get("tools_kwargs")
+            session = await self.gateway_manager.create_session(
+                session_id,
+                sampling_params=dict(sampling_params),
             )
-        return scored_trajectories, sample_fields
+            logger.info(
+                "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
+                session_id,
+                runner_name,
+                sample_index,
+                session_index,
+                global_steps,
+            )
+            try:
+                if runner_config.dispatch_mode == "ray_task":
+                    # Ray workers run only the runner. Gateway token truth,
+                    # finalization, reward scoring, and TQ writes stay in parent.
+                    object_ref = _run_agent_runner_ray_task.remote(
+                        runner_fqn=runner_config.runner_fqn,
+                        runner_kwargs=runner_config.runner_kwargs,
+                        raw_prompt=raw_prompt,
+                        session=session,
+                        sample_index=sample_index,
+                        tools_kwargs=tools_kwargs,
+                    )
+                    await object_ref
+                else:
+                    runner = self._inline_runners[runner_name]
+                    await runner(
+                        raw_prompt=raw_prompt,
+                        session=session,
+                        sample_index=sample_index,
+                        **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
+                    )
+                session_trajectories = await self.gateway_manager.finalize_session(session_id)
+            except Exception:
+                logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
+                await self.gateway_manager.abort_session(session_id)
+                raise
+
+            if not session_trajectories:
+                return session_trajectories, sample_fields
+
+            # Prefer the reward the runner posted to the session (report_reward=True);
+            # otherwise defer to the RewardLoopWorker (if any), else rm_scores stays 0.
+            annotations = self._score_from_reward_info(session_trajectories)
+            reward_source = "reward_info" if annotations is not None else None
+            if annotations is None and self.reward_loop_worker_handles:
+                annotations = await self._score_trajectories(session_trajectories, sample_fields)
+                reward_source = "reward_loop_worker"
+
+            if annotations is None:
+                logger.warning("session %s: no reward available; rm_scores=0 for this sample", session_id)
+                result_trajectories = session_trajectories
+            else:
+                logger.info("session %s: scored via %s", session_id, reward_source)
+                result_trajectories = [
+                    replace(
+                        traj,
+                        reward_score=score,
+                        extra_fields={**traj.extra_fields, "reward_extra_info": extra},
+                    )
+                    for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
+                ]
+
+            self._log_trajectory_summary(session_id, result_trajectories)
+            if run_dir is not None:
+                await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+            return result_trajectories, sample_fields
+
+    def _log_trajectory_summary(self, session_id: str, trajectories: list[Trajectory]) -> None:
+        """Log a per-session trajectory summary -- the info the task layer can't emit,
+        since trajectories exist only after the session finalizes. Written as INFO under
+        the session's run_id, so it lands in that sample's log next to the runner's
+        agent/tool/sandbox lines."""
+        lines = [f"session {session_id}: {len(trajectories)} trajectory(ies)"]
+        for i, traj in enumerate(trajectories):
+            model_tokens = sum(traj.response_mask) if traj.response_mask else 0
+            reason = (traj.extra_fields or {}).get("materialization_reason")
+            lines.append(
+                f"  [{i}] turns={traj.num_turns} prompt_tokens={len(traj.prompt_ids)} "
+                f"response_tokens={len(traj.response_ids)} model_tokens={model_tokens} "
+                f"logprobs={'yes' if traj.response_logprobs else 'no'} "
+                f"experts={'yes' if traj.routed_experts is not None else 'no'} "
+                f"reward_score={traj.reward_score} reward_info={traj.reward_info or {}}"
+                + (f" materialization_reason={reason}" if reason else "")
+            )
+        logger.info("\n".join(lines))
+
+    def _dump_trajectories(self, run_dir: Path, session_id: str, trajectories: list[Trajectory]) -> None:
+        """Persist finalized trajectories next to ``run.log``.
+
+        Split by cost: a small human-readable summary (reward, turns, lengths) is written
+        to ``trajectory.json``; the bulky per-token arrays (ids / mask / logprobs) go to a
+        compressed ``trajectory.npz``. The arrays serialize at C speed and compress well
+        (token ids repeat, the mask is runs of 0/1), so this is far smaller and faster than
+        the old indented-JSON dump -- which matters most on a network / HDFS log_dir.
+
+        Runs off the event loop (caller wraps this in ``asyncio.to_thread``) and is
+        best-effort: an IO / serialization error is logged but never aborts the rollout.
+        """
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            meta = {
+                "session_id": session_id,
+                "num_trajectories": len(trajectories),
+                "trajectories": [self._trajectory_meta(traj) for traj in trajectories],
+            }
+            (run_dir / "trajectory.json").write_text(
+                json.dumps(meta, ensure_ascii=False, separators=(",", ":"), default=_json_default),
+                encoding="utf-8",
+            )
+            arrays: dict[str, np.ndarray] = {}
+            for i, traj in enumerate(trajectories):
+                arrays[f"traj{i}_prompt_ids"] = np.asarray(traj.prompt_ids, dtype=np.int32)
+                arrays[f"traj{i}_response_ids"] = np.asarray(traj.response_ids, dtype=np.int32)
+                arrays[f"traj{i}_response_mask"] = np.asarray(traj.response_mask, dtype=np.int8)
+                if traj.response_logprobs is not None:
+                    arrays[f"traj{i}_response_logprobs"] = np.asarray(traj.response_logprobs, dtype=np.float32)
+
+            buf = io.BytesIO()
+            np.savez_compressed(buf, **arrays)
+            (run_dir / "trajectory.npz").write_bytes(buf.getvalue())
+        except Exception:
+            logger.exception("session %s: failed to write trajectory dump under %s", session_id, run_dir)
+
+    def _trajectory_meta(self, traj: Trajectory) -> dict[str, object]:
+        """Small, human-readable per-trajectory summary; the token arrays live in the npz."""
+        extra = traj.extra_fields or {}
+        return {
+            "num_turns": traj.num_turns,
+            "reward_score": traj.reward_score,
+            "reward_info": traj.reward_info or {},
+            "reward_extra_info": extra.get("reward_extra_info"),
+            "materialization_reason": extra.get("materialization_reason"),
+            "prompt_len": len(traj.prompt_ids),
+            "response_len": len(traj.response_ids),
+            "model_token_count": sum(traj.response_mask) if traj.response_mask else 0,
+            "has_routed_experts": traj.routed_experts is not None,
+            "has_logprobs": traj.response_logprobs is not None,
+        }
+
+    def _score_from_reward_info(
+        self, session_trajectories: list[Trajectory]
+    ) -> list[tuple[float, dict[str, object]]] | None:
+        """Score from the reward the runner posted to the session, if any.
+
+        reward_score = the posted ``reward``; anything else posted (e.g. ``acc``) rides
+        along as reward_extra_info. See ``task_runner._post_reward_info`` for what's posted.
+        """
+        reward_info = dict(session_trajectories[-1].reward_info or {})
+        reward = reward_info.pop("reward", None)
+        if reward is None:
+            return None
+        return [(float(reward), reward_info)] * len(session_trajectories)
 
     async def _score_trajectories(
         self,
@@ -695,12 +876,9 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         else:
             field["rollout_log_probs"] = torch.zeros_like(responses, dtype=torch.float32)
         if trajectory.routed_experts is not None:
-            field["routed_experts"] = (
-                torch.from_numpy(trajectory.routed_experts.copy())
-                if hasattr(trajectory.routed_experts, "copy")
-                and not isinstance(trajectory.routed_experts, torch.Tensor)
-                else trajectory.routed_experts
-            )
+            aligned_experts = _align_routed_experts(trajectory.routed_experts, input_ids.size(0))
+            if aligned_experts is not None:
+                field["routed_experts"] = aligned_experts
         rm_scores = torch.zeros_like(responses, dtype=torch.float32)
         if trajectory.reward_score is not None and responses.numel() > 0:
             rm_scores[-1] = float(trajectory.reward_score)
@@ -719,8 +897,13 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
         prompt_len = prompts.size(0)
         response_len = responses.size(0)
+
+        min_global_steps = trajectory.extra_fields.get("min_global_steps", global_steps)
+        max_global_steps = trajectory.extra_fields.get("max_global_steps", global_steps)
         tag = {
             "global_steps": global_steps,
+            "min_global_steps": global_steps if min_global_steps is None else min_global_steps,
+            "max_global_steps": global_steps if max_global_steps is None else max_global_steps,
             "status": "success",
             "prompt_len": prompt_len,
             "response_len": response_len,

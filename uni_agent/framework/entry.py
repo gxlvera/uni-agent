@@ -38,7 +38,6 @@ def build_gateway_manager(*, config, llm_client) -> GatewayManager:
 
     # Match AgentLoopWorker pattern: self-load tokenizer/processor via HFModelConfig.
     model_config: HFModelConfig = omega_conf_to_dataclass(config.actor_rollout_ref.model)
-
     gateway_actor_config = GatewayActorConfig(
         tokenizer=model_config.tokenizer,
         processor=model_config.processor,
@@ -143,4 +142,17 @@ class AgentFrameworkRolloutAdapter:
             raise RuntimeError("framework must be initialized before generate_sequences")
 
         self.framework_worker.generate_sequences.remote(prompts)
+        return None
+
+    def generate_sequences_and_wait(self, prompts) -> None:
+        """Blocking variant of :meth:`generate_sequences` for standalone (non-trainer) runs.
+
+        :meth:`generate_sequences` is fire-and-forget (the trainer consumes TQ asynchronously
+        via its ReplayBuffer); this awaits the framework worker so the caller knows every
+        session's trajectory has landed in TQ, and re-raises any worker-side error.
+        """
+        if self.framework_worker is None:
+            raise RuntimeError("framework must be initialized before generate_sequences")
+
+        ray.get(self.framework_worker.generate_sequences.remote(prompts))
         return None

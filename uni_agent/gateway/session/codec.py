@@ -12,9 +12,9 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-from verl.utils.chat_template import apply_chat_template as _apply_chat_template
-from verl.utils.chat_template import initialize_system_prompt
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
+from verl.utils.tokenizer.chat_template import initialize_system_prompt
 
 logger = logging.getLogger("gateway")
 
@@ -141,8 +141,6 @@ class MessageCodec:
         self._vision_info_extractor = vision_info_extractor or self._default_vision_info_extractor
         self._vision_info_extractor_kwargs = dict(vision_info_extractor_kwargs or {})
         self._apply_chat_template_kwargs = dict(apply_chat_template_kwargs or {})
-        # The processor can add prefix tokens that the bare tokenizer does not,
-        # so derive the cached default prefix from the encoder used by full encoding.
         self._system_prompt = initialize_system_prompt(
             self._processor if self._processor is not None else tokenizer,
             **self._apply_chat_template_kwargs,
