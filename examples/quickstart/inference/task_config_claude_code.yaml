@@ -1,10 +1,7 @@
 - name: swe_bench
-  log_dir: /tmp/uni_agent_logs/swe_bench_claude_code
   sandbox:
     provider: modal
     runtime_timeout: 7200
-    sandbox_kwargs:
-      memory_gb: 8
   agent:
     name: claude_code
     max_turns: 200
