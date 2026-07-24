@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
+import numpy as np
 import pytest
+import torch
 
 from tests.uni_agent.support import logging_runner
-from uni_agent.framework.framework import OpenAICompatibleAgentFramework
+from uni_agent.framework.framework import OpenAICompatibleAgentFramework, _align_routed_experts
 from uni_agent.gateway.session import SessionHandle, Trajectory
 from verl.utils import tensordict_utils as tu
 
@@ -58,6 +60,7 @@ def _inline_runner_config(
     runner,
     *,
     dispatch_mode: str = "inline_async",
+    trajectory_selection: str | None = None,
 ) -> dict[str, object]:
     runner_key = f"runner-{len(_TEST_INLINE_RUNNERS)}"
     _TEST_INLINE_RUNNERS[runner_key] = runner
@@ -66,6 +69,8 @@ def _inline_runner_config(
         "runner_kwargs": {"runner_key": runner_key},
         "dispatch_mode": dispatch_mode,
     }
+    if trajectory_selection is not None:
+        config["trajectory_selection"] = trajectory_selection
     return config
 
 
@@ -276,21 +281,25 @@ def _trajectory(
     *,
     prompt_ids: list[int] | None = None,
     response_ids: list[int] | None = None,
+    response_mask: list[int] | None = None,
     response_logprobs: list[float] | None = None,
     reward_info: dict[str, object] | None = None,
     num_turns: int = 2,
+    routed_experts: object | None = None,
     extra_fields: dict[str, object] | None = None,
 ):
     prompt_ids = prompt_ids or [10, 11]
     response_ids = response_ids or [20, 21]
+    response_mask = response_mask if response_mask is not None else [1] * len(response_ids)
     return Trajectory(
         prompt_ids=prompt_ids,
         response_ids=response_ids,
-        response_mask=[1] * len(response_ids),
+        response_mask=response_mask,
         response_logprobs=response_logprobs,
         reward_info=dict(reward_info or {}),
         reward_score=None,
         num_turns=num_turns,
+        routed_experts=routed_experts,
         multi_modal_data={"images": ["raw-image-should-not-be-written"]},
         extra_fields=dict(extra_fields or {}),
     )
@@ -530,6 +539,14 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
             "session-sample-0-rollout-0": [
                 _trajectory(
                     response_logprobs=[-0.1, -0.2],
+                    routed_experts=np.array(
+                        [
+                            [[0, 1], [2, 3]],
+                            [[4, 5], [6, 7]],
+                            [[8, 9], [10, 11]],
+                        ],
+                        dtype=np.uint8,
+                    ),
                     extra_fields={"materialization_reason": "max_response_length"},
                 )
             ],
@@ -587,6 +604,8 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     assert fields["input_ids"].is_nested
     assert fields["response_mask"].is_nested
     assert fields["position_ids"].is_nested
+    assert fields["routed_experts"].is_nested
+    assert fields["routed_experts"].dtype == torch.uint8
     assert fields["prompts"][0].tolist() == [10, 11]
     assert fields["responses"][0].tolist() == [20, 21]
     assert fields["response_mask"][0].tolist() == [1, 1]
@@ -594,6 +613,12 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     assert fields["input_ids"][0].tolist() == [10, 11, 20, 21]
     assert fields["attention_mask"][0].tolist() == [1, 1, 1, 1]
     assert fields["position_ids"][0].tolist() == [0, 1, 2, 3]
+    assert fields["routed_experts"][0].tolist() == [
+        [[0, 1], [2, 3]],
+        [[4, 5], [6, 7]],
+        [[8, 9], [10, 11]],
+        [[0, 0], [0, 0]],
+    ]
     assert fields["rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2])
     assert fields["rm_scores"][0].tolist() == [0.0, 0.25]
     assert tu.get(fields, "multi_modal_inputs") == [{}]
@@ -608,6 +633,14 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     assert tu.get(fields, "global_steps") == [7]
     assert fields["num_turns"].tolist() == [2]
     assert "multi_modal_data" not in fields.keys()
+
+
+def test_align_routed_experts_preserves_backend_dtype():
+    aligned = _align_routed_experts(np.array([[[256, 511]]], dtype=np.uint16), seq_len=2)
+
+    assert aligned is not None
+    assert aligned.dtype == torch.uint16
+    assert aligned.tolist() == [[[256, 511]], [[0, 0]]]
 
 
 @pytest.mark.asyncio
@@ -639,6 +672,58 @@ async def test_generate_sequences_batches_length_trajectory_before_normal_trajec
     assert "materialization_reason" not in batch["fields"].keys()
     assert batch["fields"]["responses"][0].tolist() == [20]
     assert batch["fields"]["responses"][1].tolist() == [21]
+
+
+@pytest.mark.asyncio
+async def test_generate_sequences_selects_longest_model_token_trajectory(fake_tq):
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(
+                    response_ids=[20, 21, 22, 23, 24, 25],
+                    response_mask=[1, 0, 0, 0, 0, 0],
+                    num_turns=10,
+                ),
+                _trajectory(
+                    response_ids=[30, 31, 32],
+                    response_mask=[1, 1, 1],
+                    num_turns=2,
+                ),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": _inline_runner_config(
+                _async_noop_runner,
+                trajectory_selection="longest",
+            )
+        },
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert len(fake_tq.batch_puts) == 1
+    batch = fake_tq.batch_puts[0]
+    assert batch["keys"] == ["uid-0_0_0"]
+    assert batch["fields"]["responses"][0].tolist() == [30, 31, 32]
+    assert batch["fields"]["response_mask"][0].tolist() == [1, 1, 1]
+    assert batch["fields"]["num_turns"].tolist() == [2]
+
+
+@pytest.mark.asyncio
+async def test_framework_rejects_unknown_trajectory_selection(fake_tq):
+    with pytest.raises(ValueError, match="Unknown trajectory selection"):
+        await _build_framework_with_agent_runners(
+            agent_runners={
+                "runner": _inline_runner_config(
+                    _async_noop_runner,
+                    trajectory_selection="shortest",
+                )
+            },
+            gateway_manager=_FakeGatewayManager({}),
+        )
 
 
 @pytest.mark.asyncio

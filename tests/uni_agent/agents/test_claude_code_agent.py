@@ -130,9 +130,23 @@ def test_run_uses_sandbox_default_workdir():
 
     assert len(sandbox.exec_calls) == 1
     assert sandbox.exec_calls[0]["workdir"] is None
+    argv = sandbox.exec_calls[0]["argv"]
+    assert argv[:2] == ["claude", "-p"]
+    assert argv[argv.index("--model") + 1] == "policy"
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    assert "--bare" not in argv
+    assert "--no-session-persistence" not in argv
+    assert "--disable-slash-commands" not in argv
+    assert "--dangerously-skip-permissions" not in argv
+    disallowed_tools = argv[argv.index("--disallowedTools") + 1].split(",")
+    assert set(disallowed_tools) == {"Agent", "Task", "WebFetch", "WebSearch", "AskUserQuestion"}
     assert sandbox.exec_calls[0]["env"]["ANTHROPIC_BASE_URL"] == "https://ark.example/api/compatible"
     assert sandbox.exec_calls[0]["env"]["ANTHROPIC_API_KEY"] == ""
     assert sandbox.exec_calls[0]["env"]["ANTHROPIC_AUTH_TOKEN"] == "ark-test-api-key"
+    assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+    assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
+    assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_FORK_SUBAGENT"] == "0"
+    assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
 
 
 def test_claude_env_uses_placeholders_for_session_gateway():

@@ -53,6 +53,7 @@ class _RunnerConfig:
     runner_kwargs: dict[str, object]
     dispatch_mode: str
     max_concurrent_sessions: int
+    trajectory_selection: str = "all"
 
     def __post_init__(self) -> None:
         if not self.runner_fqn:
@@ -61,6 +62,8 @@ class _RunnerConfig:
             raise ValueError(f"Unknown dispatch mode: {self.dispatch_mode}")
         if self.max_concurrent_sessions < 0:
             raise ValueError(f"max_concurrent_sessions must be non-negative, got {self.max_concurrent_sessions}")
+        if self.trajectory_selection not in {"all", "longest"}:
+            raise ValueError(f"Unknown trajectory selection: {self.trajectory_selection}. Expected 'all' or 'longest'")
 
     @classmethod
     def from_config(cls, runner_name: object, runner_cfg) -> _RunnerConfig:
@@ -78,12 +81,14 @@ class _RunnerConfig:
             runner_kwargs["tool_config"] = tool_config
         dispatch_mode = str(runner_cfg.get("dispatch_mode", "inline_async"))
         max_concurrent_sessions = int(runner_cfg.get("max_concurrent_sessions", 0) or 0)
+        trajectory_selection = str(runner_cfg.get("trajectory_selection", "all"))
         try:
             return cls(
                 runner_fqn="" if runner_fqn is None else str(runner_fqn),
                 runner_kwargs=runner_kwargs,
                 dispatch_mode=dispatch_mode,
                 max_concurrent_sessions=max_concurrent_sessions,
+                trajectory_selection=trajectory_selection,
             )
         except ValueError as exc:
             raise ValueError(f"agent_runners.{runner_name}: {exc}") from exc
@@ -135,6 +140,36 @@ def _short_failure_reason(error: BaseException) -> str:
     return f"{error.__class__.__name__}:{message}"[:512]
 
 
+def _select_session_trajectories(
+    session_id: str,
+    trajectories: list[Trajectory],
+    selection: str,
+) -> list[Trajectory]:
+    """Apply the runner's trajectory-retention policy before scoring and TQ writes."""
+    if selection == "all" or len(trajectories) <= 1:
+        return trajectories
+
+    index, trajectory = max(
+        enumerate(trajectories),
+        key=lambda item: (
+            sum(item[1].response_mask),
+            len(item[1].response_ids),
+            item[1].num_turns,
+            item[0],
+        ),
+    )
+    logger.info(
+        "session %s: selected longest trajectory index=%s model_tokens=%s response_tokens=%s turns=%s candidates=%s",
+        session_id,
+        index,
+        sum(trajectory.response_mask),
+        len(trajectory.response_ids),
+        trajectory.num_turns,
+        len(trajectories),
+    )
+    return [trajectory]
+
+
 _TQ_NESTED_SEQUENCE_FIELDS = {
     "prompts",
     "responses",
@@ -166,18 +201,11 @@ def _json_default(obj: object) -> object:
 
 
 def _align_routed_experts(source: object, seq_len: int) -> torch.Tensor | None:
-    """Return R3 routing as an int64 ``[seq_len, layers, topk]`` tensor aligned to input_ids.
-
-    The gateway stores the last turn's routing, which already spans ``prompt + response``
-    (the backend re-prefills the full context each turn). Zero-pad / truncate defensively so
-    the field always matches ``input_ids`` even on early-return trajectories with trailing
-    context tokens; a wrong length would crash Megatron's packed-sequence replay.
-    """
-    experts = torch.as_tensor(source)
+    """Return R3 routing as ``[seq_len, layers, topk]`` aligned to input_ids."""
+    experts = torch.as_tensor(source, device="cpu")
     if experts.dim() != 3:
         return None
-    experts = experts.to(dtype=torch.int64, device="cpu")
-    out = torch.zeros((seq_len, experts.shape[1], experts.shape[2]), dtype=torch.int64)
+    out = torch.zeros((seq_len, experts.shape[1], experts.shape[2]), dtype=experts.dtype)
     covered = min(experts.shape[0], seq_len)
     if covered > 0:
         out[:covered] = experts[:covered]
@@ -650,6 +678,11 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                         **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
                     )
                 session_trajectories = await self.gateway_manager.finalize_session(session_id)
+                session_trajectories = _select_session_trajectories(
+                    session_id,
+                    session_trajectories,
+                    runner_config.trajectory_selection,
+                )
             except Exception:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
                 await self.gateway_manager.abort_session(session_id)
